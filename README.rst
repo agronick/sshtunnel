@@ -4,6 +4,14 @@
 
 |pyversions| |license|
 
+**Changes in This Fork**
+
+I changed this to be an automaticially closing SSH tunnel. Using the -T flag 
+you can set the number of seconds to check for acivity. The program will shut
+itself down if there is no activity. This probablyt isn't the best way to
+do this but it works.
+
+
 **Author**: `Pahaz Blinov`_
 
 **Repo**: https://github.com/pahaz/sshtunnel/

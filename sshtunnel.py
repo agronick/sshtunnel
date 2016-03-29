@@ -10,7 +10,7 @@ The connection(s) are closed when explicitly calling the
 :meth:`SSHTunnelForwarder.stop` method or using it as a context.
 
 """
-
+import signal
 import sys
 import socket
 import getpass
@@ -21,7 +21,7 @@ import warnings
 import threading
 from binascii import hexlify
 from select import select
-
+from time import sleep
 import paramiko
 
 if sys.version_info[0] < 3:  # pragma: no cover
@@ -58,6 +58,8 @@ if os.name == 'posix':
     UnixStreamServer = socketserver.UnixStreamServer
 else:
     UnixStreamServer = socketserver.TCPServer
+
+handled_count = long(0)
 
 ########################
 #                      #
@@ -259,6 +261,36 @@ class HandlerSSHTunnelForwarderError(BaseSSHTunnelForwarderError):
     pass
 
 
+class ExitCommand(Exception):
+    pass
+
+
+def signal_handler(signal, frame):
+    raise ExitCommand()
+
+
+def check_if_tunnel_active(base, srv, timeout):
+
+    global handled_count
+
+    last_rc = -1
+    last_hc = -1
+
+    sleep(timeout)
+
+    while base.check_active:
+
+        if last_rc == srv.request_count and last_hc == handled_count:
+
+            print 'SHUTDOWN'
+            base.stop()
+            os.kill(os.getpid(), signal.SIGUSR1)
+
+        last_hc = handled_count
+        last_rc = srv.request_count
+        sleep(timeout)
+
+
 ########################
 #                      #
 #       Handlers       #
@@ -273,6 +305,9 @@ class _ForwardHandler(socketserver.BaseRequestHandler):
     logger = None
 
     def handle(self):
+
+        global handled_count
+
         uid = get_connection_id()
         info = 'In #{0} <-- {1}'.format(uid, self.client_address or
                                         self.server.local_address)
@@ -305,6 +340,7 @@ class _ForwardHandler(socketserver.BaseRequestHandler):
         try:
             while True:
                 rqst, _, _ = select([self.request, chan], [], [], 5)
+                handled_count += 1
                 if self.request in rqst:
                     data = self.request.recv(1024)
                     if TRACE:
@@ -340,6 +376,13 @@ class _ForwardServer(socketserver.TCPServer):  # Not Threading
     Non-threading version of the forward server
     """
     allow_reuse_address = True  # faster rebinding
+    request_count = long(0)
+    last_request = None
+
+    def finish_request(self, request, client_address):
+        """Finish one request by instantiating RequestHandlerClass."""
+        self.request_count += 1
+        self.last_request = self.RequestHandlerClass(request, client_address, self)
 
     @property
     def local_address(self):
@@ -767,6 +810,7 @@ class SSHTunnelForwarder(object):
             local_bind_address=None,
             local_bind_addresses=None,
             logger=None,
+            ssh_timeout=None,
             mute_exceptions=False,
             remote_bind_address=None,
             remote_bind_addresses=None,
@@ -785,6 +829,7 @@ class SSHTunnelForwarder(object):
         self.set_keepalive = set_keepalive
         self._threaded = threaded
         self._is_started = False
+        self.inactive_timeout = ssh_timeout
 
         # Check if deprecated arguments ssh_address or ssh_host were used
         for deprecated_argument in ['ssh_address', 'ssh_host']:
@@ -1258,6 +1303,12 @@ class SSHTunnelForwarder(object):
         """
         Wrapper for the server created for a SSH forward
         """
+
+        if self.inactive_timeout:
+            self.check_active = True
+            self.active_check = threading.Thread(target=check_if_tunnel_active, args=(self, _srv, self.inactive_timeout))
+            self.active_check.start()
+
         try:
             self.logger.info('Opening tunnel: {0} <> {1}'.format(
                 address_to_str(_srv.local_address),
@@ -1284,6 +1335,7 @@ class SSHTunnelForwarder(object):
 
     def _stop_transport(self):
         """ Close the underlying transport when nothing more is needed """
+        self.check_active = False
         self._transport.close()
         self._transport.stop_thread()
         self.logger.debug('Transport is closed')
@@ -1423,6 +1475,7 @@ class SSHTunnelForwarder(object):
         return self
 
     def __exit__(self, *args):
+        self.check_active = False
         self.stop()
 
 
@@ -1624,6 +1677,11 @@ def _parse_arguments(args=None):
         '-n', '--noagent', action='store_false', dest='allow_agent',
         help='Disable looking for keys from an SSH agent'
     )
+
+    parser.add_argument(
+        '-T', '--timeout', dest='ssh_timeout',
+        type=int, help='Stop tunnel if idle for x seconds.'
+    )
     return vars(parser.parse_args(args))
 
 
@@ -1647,6 +1705,7 @@ def _cli_main(args=None):
         -c (ssh_config), ssh configuration file (defaults to SSH_CONFIG_FILE)
         -z (compress)
         -n (noagent), disable looking for keys from an Agent
+        -T (timeout), kill session if idle for x seconds
     """
     arguments = _parse_arguments(args)
     verbosity = min(arguments.pop('verbose'), 3)
